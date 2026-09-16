@@ -71,6 +71,8 @@ pub struct ParseLineOutput {
     /// Ops for previously buffered lines that have now been corrected, in order.
     /// Non-empty only when a cross-line `fail` just resolved.
     pub replayed: Vec<Vec<(usize, ScopeStackOp)>>,
+    /// Absolute source line ranges for consecutive groups in `replayed`.
+    pub replay_ranges: Vec<std::ops::Range<usize>>,
     /// Warnings collected during parsing (e.g. branch point expiry).
     pub warnings: Vec<String>,
 }
@@ -93,6 +95,7 @@ pub struct ParseState {
     /// Corrected ops produced by a cross-line `fail` replay, to be returned
     /// as `ParseLineOutput::replayed` at the end of `parse_line`.
     flushed_ops: Vec<Vec<(usize, ScopeStackOp)>>,
+    flushed_ranges: Vec<std::ops::Range<usize>>,
     /// Warnings accumulated during parsing, drained into `ParseLineOutput`.
     warnings: Vec<String>,
     /// Active escape patterns from embed operations. The escape regex takes
@@ -323,6 +326,7 @@ impl ParseState {
             line_number: 0,
             pending_lines: Vec::new(),
             flushed_ops: Vec::new(),
+            flushed_ranges: Vec::new(),
             warnings: Vec::new(),
             escape_stack: Vec::new(),
         }
@@ -376,6 +380,7 @@ impl ParseState {
         // Collect any corrected ops produced by a cross-line `fail` during the
         // parse above.  These are stored by `handle_fail` in `self.flushed_ops`.
         let replayed = std::mem::take(&mut self.flushed_ops);
+        let replay_ranges = std::mem::take(&mut self.flushed_ranges);
 
         // Keep the line string for potential future cross-line replay.
         if !self.branch_points.is_empty() {
@@ -390,6 +395,7 @@ impl ParseState {
         Ok(ParseLineOutput {
             ops,
             replayed,
+            replay_ranges,
             warnings,
         })
     }
@@ -400,6 +406,22 @@ impl ParseState {
     /// `false` and all ops emitted so far are final.
     pub fn is_speculative(&self) -> bool {
         !self.branch_points.is_empty()
+    }
+
+    /// Relocates a settled checkpoint after lines are inserted or deleted.
+    /// Active branches and replay buffers retain absolute positions and cannot
+    /// be relocated. All other parser state is independent of source line numbers.
+    pub fn relocate_line(&mut self, next_line: usize) -> bool {
+        if self.is_speculative()
+            || !self.pending_lines.is_empty()
+            || !self.flushed_ops.is_empty()
+            || !self.flushed_ranges.is_empty()
+            || self.first_line != (next_line == 0)
+        {
+            return false;
+        }
+        self.line_number = next_line;
+        true
     }
 
     /// Inner parsing loop: processes `line` with the current parser state and
@@ -1054,6 +1076,7 @@ impl ParseState {
             let ops_snapshot_len = bp.ops_snapshot_len;
             let match_start_pos = bp.match_start;
             let pending_lines_snapshot_len = bp.pending_lines_snapshot_len;
+            let replay_start_line = bp.line_number;
             let prefix_ops = bp.prefix_ops.clone();
             self.branch_points.remove(bp_index);
 
@@ -1101,6 +1124,8 @@ impl ParseState {
                     };
                     replayed_ops.push(line_ops);
                 }
+                self.flushed_ranges
+                    .push(replay_start_line..replay_start_line + replayed_ops.len());
                 self.flushed_ops.extend(replayed_ops);
 
                 // Restart the current line from the beginning under the
@@ -1140,6 +1165,7 @@ impl ParseState {
         let non_consuming_push_at_snapshot = bp.non_consuming_push_at_snapshot;
         let ops_snapshot_len = bp.ops_snapshot_len;
         let pending_lines_snapshot_len = bp.pending_lines_snapshot_len;
+        let replay_start_line = bp.line_number;
         let escape_stack_snapshot = bp.escape_stack_snapshot.clone();
         let prefix_ops = bp.prefix_ops.clone();
         // bp borrow ends here.
@@ -1253,6 +1279,8 @@ impl ParseState {
             }
             // Append (rather than overwrite) in case multiple cross-line fails
             // fire on the same parse_line call.
+            self.flushed_ranges
+                .push(replay_start_line..replay_start_line + replayed_ops.len());
             self.flushed_ops.extend(replayed_ops);
 
             // Restart the current line from the beginning.
