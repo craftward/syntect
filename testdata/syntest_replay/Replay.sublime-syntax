@@ -1,0 +1,43 @@
+%YAML 1.2
+---
+name: Syntax Test Replay
+scope: source.replay
+contexts:
+  main:
+    - match: 'OUTER'
+      branch_point: outer
+      branch: [outer-try, outer-fallback]
+  outer-try:
+    - meta_scope: meta.outer.try
+    - match: 'INNER'
+      branch_point: inner
+      branch: [inner-try, inner-retry]
+  inner-try:
+    - meta_scope: meta.inner.try
+    - match: 'FAIL'
+      fail: inner
+    - match: '\w+'
+      scope: string.unquoted
+  inner-retry:
+    - meta_scope: meta.inner.retry
+    - match: 'BAD'
+      fail: outer
+    - match: '\w+'
+      scope: variable.other
+  outer-fallback:
+    - meta_scope: meta.outer.fallback
+    - match: 'LATER'
+      branch_point: later
+      branch: [later-try, later-fallback]
+    - match: '\w+'
+      scope: constant.numeric
+  later-try:
+    - meta_scope: meta.later.try
+    - match: 'FAIL_LATER'
+      fail: later
+    - match: '\w+'
+      scope: string.unquoted
+  later-fallback:
+    - meta_scope: meta.later.fallback
+    - match: '\w+'
+      scope: constant.numeric

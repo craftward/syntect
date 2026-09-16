@@ -433,7 +433,7 @@ impl ParseState {
         line: &str,
         syntax_set: &SyntaxSet,
     ) -> Result<Vec<(usize, ScopeStackOp)>, ParsingError> {
-        self.parse_line_inner_from(line, syntax_set, 0)
+        self.parse_line_inner_from(line, syntax_set, 0, Vec::new())
     }
 
     /// Parse `line` starting at `start_at` rather than column 0. Used by
@@ -448,9 +448,9 @@ impl ParseState {
         line: &str,
         syntax_set: &SyntaxSet,
         start_at: usize,
+        mut res: Vec<(usize, ScopeStackOp)>,
     ) -> Result<Vec<(usize, ScopeStackOp)>, ParsingError> {
         let mut match_start = start_at;
-        let mut res = Vec::new();
 
         if start_at == 0 && self.first_line {
             let cur_level = &self.stack[self.stack.len() - 1];
@@ -990,6 +990,49 @@ impl ParseState {
         }
     }
 
+    /// Replays history with its original line numbers and buffer positions.
+    /// Publish each corrected line before parsing the next one, so a nested
+    /// replay can replace earlier corrections without being overwritten by
+    /// stale operations collected by its caller.
+    fn replay_lines(
+        &mut self,
+        syntax_set: &SyntaxSet,
+        first_line: usize,
+        buffer_start: usize,
+        resume_at: usize,
+        prefix: Vec<(usize, ScopeStackOp)>,
+    ) -> Result<(), ParsingError> {
+        let next_line = self.line_number;
+        let lines = self.pending_lines.split_off(buffer_start);
+        let result = (|| {
+            let mut prefix = prefix;
+            for (index, line) in lines.into_iter().enumerate() {
+                let line_number = first_line + index;
+                self.line_number = line_number + 1;
+                let ops = self.parse_line_inner_from(
+                    &line,
+                    syntax_set,
+                    if index == 0 { resume_at } else { 0 },
+                    std::mem::take(&mut prefix),
+                )?;
+                if let Some(range) = self
+                    .flushed_ranges
+                    .last_mut()
+                    .filter(|r| r.end == line_number)
+                {
+                    range.end += 1;
+                } else {
+                    self.flushed_ranges.push(line_number..line_number + 1);
+                }
+                self.flushed_ops.push(ops);
+                self.pending_lines.push(line);
+            }
+            Ok(())
+        })();
+        self.line_number = next_line;
+        result
+    }
+
     /// Handle a `fail` operation by rewinding to the named branch point.
     /// Returns Ok(true) if backtracking happened (caller should continue from rewound position).
     /// Returns Ok(false) if the fail had no effect.
@@ -1078,7 +1121,7 @@ impl ParseState {
             let pending_lines_snapshot_len = bp.pending_lines_snapshot_len;
             let replay_start_line = bp.line_number;
             let prefix_ops = bp.prefix_ops.clone();
-            self.branch_points.remove(bp_index);
+            self.branch_points.truncate(bp_index);
 
             self.stack = stack_snapshot;
             self.proto_starts = proto_starts_snapshot;
@@ -1088,45 +1131,18 @@ impl ParseState {
             ops.truncate(ops_snapshot_len.min(ops.len()));
 
             if is_cross_line {
-                // Re-parse each buffered line under the restored (pre-branch)
-                // state so `parse_line` can surface the corrected ops via
-                // `ParseLineOutput::replayed`. The first buffered line is the
-                // branch-creation line: emit its saved `prefix_ops` (the ops
-                // emitted before the branch match) verbatim, then advance past
-                // the branch match by one character before resuming — otherwise
-                // the same branch_point would fire again at the original match
-                // position and we'd loop.
-                //
-                // Keep `pending_lines` intact (don't drain): if an outer
-                // branch_point on this same line also fails after this
-                // exhaustion replay, its own replay needs access to the same
-                // buffered lines.
-                let truncated_lines: Vec<String> =
-                    self.pending_lines[pending_lines_snapshot_len..].to_vec();
-                let mut replayed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
-                    Vec::with_capacity(truncated_lines.len());
-                for (i, replay_line) in truncated_lines.iter().enumerate() {
-                    let line_ops = if i == 0 {
-                        let mut first_line_ops = prefix_ops.clone();
-                        let resume_at = if let Some((j, _)) =
-                            replay_line[match_start_pos..].char_indices().nth(1)
-                        {
-                            match_start_pos + j
-                        } else {
-                            replay_line.len()
-                        };
-                        let tail_ops =
-                            self.parse_line_inner_from(replay_line, syntax_set, resume_at)?;
-                        first_line_ops.extend(tail_ops);
-                        first_line_ops
-                    } else {
-                        self.parse_line_inner(replay_line, syntax_set)?
-                    };
-                    replayed_ops.push(line_ops);
-                }
-                self.flushed_ranges
-                    .push(replay_start_line..replay_start_line + replayed_ops.len());
-                self.flushed_ops.extend(replayed_ops);
+                let first_line = &self.pending_lines[pending_lines_snapshot_len];
+                let resume_at = first_line[match_start_pos..]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(first_line.len(), |(offset, _)| match_start_pos + offset);
+                self.replay_lines(
+                    syntax_set,
+                    replay_start_line,
+                    pending_lines_snapshot_len,
+                    resume_at,
+                    prefix_ops,
+                )?;
 
                 // Restart the current line from the beginning under the
                 // restored state.
@@ -1181,6 +1197,7 @@ impl ParseState {
 
         // Update the branch point record before popping/pushing
         // (must happen before the pop which may invalidate indices).
+        self.branch_points.truncate(bp_index + 1);
         self.branch_points[bp_index].next_alternative = next_alt_index + 1;
 
         // For pop + branch: re-pop the contexts (snapshot was taken pre-pop).
@@ -1208,99 +1225,36 @@ impl ParseState {
         });
 
         if is_cross_line {
-            // Cross-line fail: the ops for lines since the branch was created
-            // have already been returned to callers.  Re-parse those lines under
-            // the new alternative and store the corrected ops in `flushed_ops`
-            // so that `parse_line` can surface them via `ParseLineOutput::replayed`.
-            //
-            // The first buffered line is the branch-creation line. Its
-            // pre-branch prefix (cols 0..trigger_match_start) was correctly
-            // parsed under the *pre-branch* state — not the new alternative.
-            // Re-parsing it from column 0 with the new alternative on the
-            // stack would misattribute that prefix to the new alternative's
-            // rules (observed on multi-line SQL `LIKE … ESCAPE …`: every
-            // non-whitespace before `LIKE` fires `else-pop` in the
-            // escape-alternative, derailing the stack). Instead, reuse the
-            // prefix_ops saved at branch-creation time, manually emit the
-            // branch trigger's pat.scope and the new alternative's meta
-            // scope ops, then resume parsing from match_end with the new
-            // alternative on the stack via `parse_line_inner_from`.
-            // Keep `pending_lines` intact (don't drain): if a second branch_point
-            // on the current line also fails after this retry, its own replay
-            // needs access to the same buffered lines. Nested branches from the
-            // same earlier line share the buffer.
-            let truncated_lines: Vec<String> =
-                self.pending_lines[pending_lines_snapshot_len..].to_vec();
-
-            let mut replayed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
-                Vec::with_capacity(truncated_lines.len());
-            for (i, replay_line) in truncated_lines.iter().enumerate() {
-                let line_ops = if i == 0 {
-                    // First buffered line: compose prefix + branch ops + resume.
-                    let mut first_line_ops = prefix_ops.clone();
-                    // Re-emit the trigger's pat.scope and the new
-                    // alternative's meta scope ops in the same order
-                    // the non-fail push path uses: clear_scopes and
-                    // meta_scope at `trigger_match_start` (so the
-                    // matched text sees them), then pat.scope at the
-                    // same position, popped at `match_start_pos`.
-                    // meta_content_scope only applies after the
-                    // matched text, so it lands at `match_start_pos`.
-                    if let Some(clear_amount) = context.clear_scopes {
-                        first_line_ops
-                            .push((trigger_match_start, ScopeStackOp::Clear(clear_amount)));
-                    }
-                    for scope in context.meta_scope.iter() {
-                        first_line_ops.push((trigger_match_start, ScopeStackOp::Push(*scope)));
-                    }
-                    for scope in &trigger_pat_scope {
-                        first_line_ops.push((trigger_match_start, ScopeStackOp::Push(*scope)));
-                    }
-                    // See matching comment in the same-line branch below —
-                    // re-emit the trigger match's captures inside the
-                    // pat_scope brackets so they survive the branch swap.
-                    first_line_ops.extend(trigger_capture_ops.iter().cloned());
-                    if !trigger_pat_scope.is_empty() {
-                        first_line_ops
-                            .push((match_start_pos, ScopeStackOp::Pop(trigger_pat_scope.len())));
-                    }
-                    for scope in context.meta_content_scope.iter() {
-                        first_line_ops.push((match_start_pos, ScopeStackOp::Push(*scope)));
-                    }
-                    // Resume parsing from the branch match's end position.
-                    let tail_ops =
-                        self.parse_line_inner_from(replay_line, syntax_set, match_start_pos)?;
-                    first_line_ops.extend(tail_ops);
-                    first_line_ops
-                } else {
-                    self.parse_line_inner(replay_line, syntax_set)?
-                };
-                replayed_ops.push(line_ops);
+            // Seed the complete line, including its original prefix, so another
+            // failure during replay can truncate back to the branch snapshot.
+            let mut first_line_ops = prefix_ops;
+            if let Some(clear_amount) = context.clear_scopes {
+                first_line_ops.push((trigger_match_start, ScopeStackOp::Clear(clear_amount)));
             }
-            // Append (rather than overwrite) in case multiple cross-line fails
-            // fire on the same parse_line call.
-            self.flushed_ranges
-                .push(replay_start_line..replay_start_line + replayed_ops.len());
-            self.flushed_ops.extend(replayed_ops);
+            for scope in &context.meta_scope {
+                first_line_ops.push((trigger_match_start, ScopeStackOp::Push(*scope)));
+            }
+            for scope in &trigger_pat_scope {
+                first_line_ops.push((trigger_match_start, ScopeStackOp::Push(*scope)));
+            }
+            first_line_ops.extend(trigger_capture_ops);
+            if !trigger_pat_scope.is_empty() {
+                first_line_ops.push((match_start_pos, ScopeStackOp::Pop(trigger_pat_scope.len())));
+            }
+            for scope in &context.meta_content_scope {
+                first_line_ops.push((match_start_pos, ScopeStackOp::Push(*scope)));
+            }
+            self.replay_lines(
+                syntax_set,
+                replay_start_line,
+                pending_lines_snapshot_len,
+                match_start_pos,
+                first_line_ops,
+            )?;
 
-            // Restart the current line from the beginning.
             ops.clear();
             *start = 0;
             *non_consuming_push_at = (0, 0);
-
-            // Guard: the replayed `parse_line_inner` calls above can
-            // mutate `self.branch_points` (adding new branches,
-            // removing expired or exhausted ones), which can shift or
-            // invalidate `bp_index`. Indexing with the stale position
-            // previously panicked outright on files that exercise
-            // nested cross-line branching (observed on
-            // `JavaScript/syntax_test_js.js` and
-            // `syntax_test_typescript.ts`). Skip the bookkeeping if
-            // the branch point has been removed — the replay already
-            // completed, which is the essential work of the fail.
-            if bp_index < self.branch_points.len() {
-                self.branch_points[bp_index].ops_snapshot_len = 0;
-            }
         } else {
             // Same-line fail: truncate ops back to the snapshot point and rewind.
             ops.truncate(ops_snapshot_len.min(ops.len()));

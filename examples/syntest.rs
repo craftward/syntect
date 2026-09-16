@@ -11,7 +11,7 @@
 use syntect::easy::ScopeRegionIterator;
 use syntect::highlighting::ScopeSelectors;
 use syntect::parsing::{
-    ParseLineOutput, ParseState, Scope, ScopeStack, SyntaxSet, SyntaxSetBuilder,
+    ParseLineOutput, ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxSet, SyntaxSetBuilder,
 };
 
 use std::cmp::{max, min};
@@ -204,6 +204,7 @@ struct NonAssertionData {
 struct ParsedLineRecord {
     line_text: String,
     line_number: usize,
+    ops: Vec<(usize, ScopeStackOp)>,
     stack_before: ScopeStack,
     /// Present only for non-assertion lines.
     non_assertion_data: Option<NonAssertionData>,
@@ -322,9 +323,17 @@ fn test_file(
     parse_test_lines: bool,
     out_opts: OutputOptions,
 ) -> Result<SyntaxTestFileResult, SyntaxTestHeaderError> {
-    use syntect::util::debug_print_ops;
     let f = File::open(path).unwrap();
-    let mut reader = BufReader::new(f);
+    test_reader(ss, BufReader::new(f), parse_test_lines, out_opts)
+}
+
+fn test_reader(
+    ss: &SyntaxSet,
+    mut reader: impl BufRead,
+    parse_test_lines: bool,
+    out_opts: OutputOptions,
+) -> Result<SyntaxTestFileResult, SyntaxTestHeaderError> {
+    use syntect::util::debug_print_ops;
     let mut line = String::new();
 
     // read the first line from the file - if we have reached EOF already, it's an invalid file
@@ -447,7 +456,6 @@ fn test_file(
                     current_line_number, stack, state
                 );
             }
-            let stack_before = stack.clone();
             let output = match state.parse_line(&line, ss) {
                 Ok(output) => output,
                 Err(e) => {
@@ -464,6 +472,7 @@ fn test_file(
             let ParseLineOutput {
                 ops,
                 replayed,
+                replay_ranges,
                 warnings,
             } = output;
 
@@ -481,30 +490,37 @@ fn test_file(
                         replayed.len()
                     );
                 }
-                let buf_len = parsed_line_buffer.len();
-                let start_idx = buf_len - replayed.len();
+                // Parser line indices count only calls to parse_line, so they
+                // index this buffer even when assertion lines are skipped.
+                // Apply corrections in emission order: later ranges may
+                // replace earlier corrections for the same source lines.
+                let mut start_idx = parsed_line_buffer.len();
+                let mut corrections = replayed.into_iter();
+                for index in replay_ranges.into_iter().flatten() {
+                    parsed_line_buffer[index].ops = corrections
+                        .next()
+                        .expect("parser replay is missing line operations");
+                    start_idx = start_idx.min(index);
+                }
+                assert!(corrections.next().is_none(), "unlocated parser replay");
 
-                // Collect replayed line numbers for pruning pending messages
-                let replayed_line_numbers: Vec<usize> = (start_idx..buf_len)
-                    .map(|i| parsed_line_buffer[i].line_number)
-                    .collect();
-                // Remove pending messages whose test_against_line_number
-                // matches any replayed line — they will be regenerated below
-                pending_messages
-                    .retain(|m| !replayed_line_numbers.contains(&m.test_against_line_number));
+                // Rebuild the entire affected suffix, including unchanged ops
+                // whose incoming scope stack may have changed.
+                let first_line_number = parsed_line_buffer[start_idx].line_number;
+                pending_messages.retain(|m| m.test_against_line_number < first_line_number);
 
                 // Reset stack to the state before the first replayed line
                 stack = parsed_line_buffer[start_idx].stack_before.clone();
 
-                for (i, replayed_ops) in replayed.iter().enumerate() {
-                    let record = &mut parsed_line_buffer[start_idx + i];
+                for record in parsed_line_buffer.iter_mut().skip(start_idx) {
+                    record.stack_before = stack.clone();
                     let has_non_assertion = record.non_assertion_data.is_some();
 
                     // Advance the stack through the corrected ops, building
                     // scoped text for non-assertion lines
                     let mut new_scoped = Vec::new();
                     let mut col: usize = 0;
-                    for (s, op) in ScopeRegionIterator::new(replayed_ops, &record.line_text) {
+                    for (s, op) in ScopeRegionIterator::new(&record.ops, &record.line_text) {
                         stack.apply(op).unwrap();
                         if !s.is_empty() && has_non_assertion {
                             let len = s.chars().count();
@@ -576,6 +592,7 @@ fn test_file(
                 }
             }
 
+            let stack_before = stack.clone();
             if out_opts.debug && !line_only_has_assertion {
                 if ops.is_empty() && !line.is_empty() {
                     println!("no operations for this line...");
@@ -624,6 +641,7 @@ fn test_file(
             parsed_line_buffer.push(ParsedLineRecord {
                 line_text: line.to_string(),
                 line_number: current_line_number,
+                ops,
                 stack_before,
                 non_assertion_data,
             });
@@ -922,5 +940,89 @@ mod tests {
         // marker-boundary requirement).
         let a = details(CC, None, "//   @@@").unwrap();
         assert!(a.is_reference);
+    }
+
+    fn replay_test(source: &str, parse_test_lines: bool) -> SyntaxTestFileResult {
+        let mut builder = SyntaxSetBuilder::new();
+        builder
+            .add_from_folder(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/syntest_replay"),
+                true,
+            )
+            .unwrap();
+        let syntaxes = builder.build();
+        test_reader(
+            &syntaxes,
+            source.as_bytes(),
+            parse_test_lines,
+            OutputOptions {
+                time: false,
+                debug: false,
+                summary: true,
+            },
+        )
+        .unwrap()
+    }
+
+    const OVERLAPPING_REPLAY_TEST: &str = r#"# SYNTAX TEST "Replay.sublime-syntax"
+OUTER
+INNER value
+#<- constant.numeric
+#<- meta.outer.fallback
+something
+#<- constant.numeric
+BAD
+#<- constant.numeric
+FAIL
+#<- constant.numeric
+"#;
+
+    #[test]
+    fn overlapping_replay_rechecks_assertions_in_source_order() {
+        // Skipping assertion lines separates file line numbers from parser
+        // line indices; both modes must locate the same corrected source.
+        for parse_test_lines in [true, false] {
+            assert_eq!(
+                replay_test(OVERLAPPING_REPLAY_TEST, parse_test_lines),
+                SyntaxTestFileResult::Success(5),
+                "parse_test_lines={parse_test_lines}",
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_replay_counts_only_final_scope_failures() {
+        let source = OVERLAPPING_REPLAY_TEST.replacen("constant.numeric", "string.unquoted", 1);
+        for parse_test_lines in [true, false] {
+            assert_eq!(
+                replay_test(&source, parse_test_lines),
+                SyntaxTestFileResult::FailedAssertions(1, 5),
+                "parse_test_lines={parse_test_lines}",
+            );
+        }
+    }
+
+    #[test]
+    fn later_replay_uses_corrected_scope_snapshots() {
+        let source = r#"# SYNTAX TEST "Replay.sublime-syntax"
+OUTER
+INNER value
+something
+BAD
+FAIL LATER value
+#<- meta.outer.fallback - meta.outer.try
+#          ^^^^^ meta.later.fallback
+FAIL_LATER
+#<- meta.outer.fallback - meta.outer.try
+#<- meta.later.fallback
+#<- constant.numeric
+"#;
+        for parse_test_lines in [true, false] {
+            assert_eq!(
+                replay_test(source, parse_test_lines),
+                SyntaxTestFileResult::Success(9),
+                "parse_test_lines={parse_test_lines}",
+            );
+        }
     }
 }

@@ -90,6 +90,10 @@ regex-syntax.opt-level = 2
 [lib]
 bench = false
 
+[[example]]
+name = "syntest"
+test = true
+
 [[bench]]
 name = "highlighting"
 harness = false
